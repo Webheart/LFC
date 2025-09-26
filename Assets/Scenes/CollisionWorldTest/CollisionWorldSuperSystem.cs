@@ -1,9 +1,12 @@
 using Latios;
 using Latios.Psyshock;
+using Latios.Transforms;
 using Scenes.UniqueMeshTests.UniqueMeshTests;
 using Unity.Burst;
+using Unity.Collections;
 using Unity.Entities;
 using Unity.Jobs;
+using Unity.Mathematics;
 using UnityEngine;
 using Physics = Latios.Psyshock.Physics;
 
@@ -15,12 +18,20 @@ namespace CollisionWorldTest
         {
             GetOrCreateAndAddUnmanagedSystem<BuildCollisionWorldSystem>();
             GetOrCreateAndAddUnmanagedSystem<FindCollisionPairsSystem>();
+            GetOrCreateAndAddUnmanagedSystem<SpawnerSystem>();
         }
     }
     
     
     public struct BodyOne : IComponentData { }
     public struct BodyTwo : IComponentData { }
+    public struct Raycaster : IComponentData { }
+
+    public struct Spawner : IComponentData
+    {
+        public Entity Prefab;
+        public bool Spawned;
+    }
     
     public partial struct CollisionWorldHolder : ICollectionComponent
     {
@@ -70,6 +81,50 @@ namespace CollisionWorldTest
             latiosWorld.sceneBlackboardEntity.RemoveCollectionComponentAndDispose<CollisionWorldHolder>();
         }
     }
+    
+    [BurstCompile]
+    public partial struct SpawnerSystem : ISystem
+    {
+        LatiosWorldUnmanaged latiosWorld;
+
+
+        [BurstCompile]
+        public void OnCreate(ref SystemState state)
+        {
+            latiosWorld = state.GetLatiosWorldUnmanaged();
+        }
+
+
+        [BurstCompile]
+        public void OnUpdate(ref SystemState state)
+        {
+            new SpawnJob()
+            {
+                Icb = latiosWorld.syncPoint.CreateInstantiateCommandBuffer<WorldTransform>(),
+            }.Schedule();
+        }
+
+        partial struct SpawnJob : IJobEntity
+        {
+            public InstantiateCommandBuffer<WorldTransform> Icb;
+            
+            void Execute([ChunkIndexInQuery] int chunkIndexInQuery, ref Spawner spawner)
+            {
+                if (spawner.Spawned) return;
+                spawner.Spawned = true;
+
+                for (int i = -1; i < 2; i++)
+                for (int j = -1; j < 2; j++)
+                {
+                    Icb.Add(spawner.Prefab, new WorldTransform
+                    {
+                        worldTransform = new TransformQvvs(new float3(i *100, 0,  j *100), quaternion.identity),
+                    });
+                }
+                Debug.Log("spawner.Spawned");
+            }
+        }
+    }
 
     [BurstCompile]
     public partial struct FindCollisionPairsSystem : ISystem, ISystemShouldUpdate
@@ -103,6 +158,12 @@ namespace CollisionWorldTest
             state.Dependency = Physics.FindPairs(in collisionWorld, in bodiesOneQueryMask, new OneVsOneBodiesProcessor
             {
             }).ScheduleSingle(state.Dependency);
+            
+            state.Dependency = new RaycastJob()
+            {
+                World = collisionWorld,
+                QueryMask = bodiesTwoQueryMask
+            }.Schedule(state.Dependency);
         }
 
         struct OneVsTwoBodiesProcessor : IFindPairsProcessor
@@ -122,6 +183,37 @@ namespace CollisionWorldTest
             {
                 PhysicsDebug.DrawAabb(result.aabbA, Color.green);
                 PhysicsDebug.DrawAabb(result.aabbB, Color.green);
+            }
+        }
+        
+        [BurstCompile]
+        partial struct RaycastJob : IJobEntity
+        {
+            [ReadOnly] public CollisionWorld World;
+            [ReadOnly] public EntityQueryMask QueryMask;
+            
+            CollisionWorld.Mask mask;
+            void Execute(in WorldTransform transform, in Raycaster raycaster)
+            {
+                if (!mask.isCreated) mask = World.CreateMask(QueryMask);
+                
+                var start = transform.position;
+                var end = transform.position + transform.forwardDirection * 20;
+                Debug.DrawLine(start, end, Color.red);
+
+                if (!Physics.RaycastAny(start, end, in World, in mask, out var result, out var info))
+                {
+                    var enumerator = Physics.FindObjects(Physics.AabbFrom(start, end), World, mask);
+                    foreach (var r in enumerator)
+                    {
+                        PhysicsDebug.DrawAabb(r.aabb, Color.red);
+                        Debug.Log($"RayCast fails. FindObjects: Aabb from ray {start}, {end}; bodyIndex: {r.bodyIndex}, entity {r.entity.entity.Index}");
+                    }
+                    return;
+                }
+                PhysicsDebug.DrawAabb(info.aabb, Color.green);
+                PhysicsDebug.DrawCollider(info.collider, info.transform, Color.chocolate);
+                Debug.Log($"hit entity {info.entity.Index}, bodyIndex {info.bodyIndex}, aabb from {info.aabb.min} to {info.aabb.max}");
             }
         }
     }
